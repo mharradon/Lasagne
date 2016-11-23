@@ -282,6 +282,8 @@ class ConcatLayer(MergeLayer):
 
         # Check for compatibility with inferred output shape
         if not all(match(shape, output_shape) for shape in input_shapes):
+            import pdb
+            pdb.set_trace()
             raise ValueError("Mismatch: input shapes must be the same except "
                              "in the concatenation axis")
         # Infer output shape on concatenation axis and return
