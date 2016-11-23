@@ -323,7 +323,7 @@ class Pool3DLayer(Layer):
 
     def __init__(self, incoming, pool_size, stride=None, pad=(0, 0, 0),
                  ignore_border=True, mode='max', **kwargs):
-        super(Pool2DLayer, self).__init__(incoming, **kwargs)
+        super(Pool3DLayer, self).__init__(incoming, **kwargs)
 
         self.pool_size = as_tuple(pool_size, 3)
 
