@@ -8,9 +8,8 @@ from .base import Layer
 from .conv import conv_output_length, BaseConvLayer
 from ..utils import as_tuple
 
-from theano.sandbox.cuda.basic_ops import gpu_contiguous
-from theano.sandbox.cuda.blas import GpuCorrMM
-
+from theano.gpuarray.basic_ops import gpu_contiguous
+from theano.gpuarray.blas import GpuCorrMM
 
 __all__ = [
     "Conv2DMMLayer",
