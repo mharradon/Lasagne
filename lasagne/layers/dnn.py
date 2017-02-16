@@ -1,5 +1,4 @@
 import theano
-from theano.sandbox.cuda import dnn
 
 from .. import init
 from .. import nonlinearities
@@ -7,19 +6,23 @@ from .base import Layer
 
 from .conv import conv_output_length, BaseConvLayer
 from .pool import pool_output_length
-from .normalization import BatchNormLayer
 from ..utils import as_tuple
 
-if not theano.sandbox.cuda.cuda_enabled:
-    raise ImportError(
-            "requires GPU support -- see http://lasagne.readthedocs.org/en/"
-            "latest/user/installation.html#gpu-support")  # pragma: no cover
-elif not dnn.dnn_available():
-    raise ImportError(
-            "cuDNN not available: %s\nSee http://lasagne.readthedocs.org/en/"
-            "latest/user/installation.html#cudnn" %
-            dnn.dnn_available.msg)  # pragma: no cover
+from lasagne.layers import BatchNormLayer
 
+if theano.gpuarray.dnn.dnn_present():
+    from theano.gpuarray import dnn 
+    from theano.tensor.signal.pool import pool_3d
+    from theano.tensor.nnet.bn import batch_normalization_train
+    from theano.tensor.nnet import conv3d
+    print("Using New Theano Backend")
+elif theano.sandbox.cuda.dnn.dnn_available():
+    from theano.sandbox.cuda import dnn
+    print("Using Old Theano Backend")     
+else:
+    raise ImportError(
+        "requires GPU support with cuDNN available -- see http://lasagne.readthedocs.org/en/"
+        "latest/user/installation.html#gpu-support")  # pragma: no cover
 
 __all__ = [
     "Pool2DDNNLayer",
@@ -254,6 +257,13 @@ class MaxPool3DDNNLayer(Pool3DDNNLayer):
         super(MaxPool3DDNNLayer, self).__init__(incoming, pool_size, stride,
                                                 pad, ignore_border, mode='max',
                                                 **kwargs)
+    def get_output_for(self, input, **kwargs):
+        """
+        return dnn.dnn_pool(input, self.pool_size, self.stride,
+                            self.mode, self.pad)
+        """
+        return pool_3d(input, self.pool_size, stride=self.stride, \
+                       pad=self.pad,mode=self.mode)
 
 
 class Conv2DDNNLayer(BaseConvLayer):
@@ -497,13 +507,20 @@ class Conv3DDNNLayer(BaseConvLayer):
         border_mode = self.pad
         if border_mode == 'same':
             border_mode = tuple(s // 2 for s in self.filter_size)
-
+        
+        """
         conved = dnn.dnn_conv3d(img=input,
                                 kerns=self.W,
                                 subsample=self.stride,
                                 border_mode=border_mode,
                                 conv_mode=conv_mode
                                 )
+        """
+        conved = conv3d(input=input,
+                        filters=self.W,
+                        subsample=self.stride,
+                        border_mode=border_mode,
+                        filter_flip=self.flip_filters)
         return conved
 
 
@@ -710,11 +727,17 @@ class BatchNormDNNLayer(BatchNormLayer):
             gamma = self.gamma or theano.tensor.ones(shape)
             beta = self.beta or theano.tensor.zeros(shape)
             mode = 'per-activation' if self.axes == (0,) else 'spatial'
+            
+            """
             (normalized,
              input_mean,
              input_inv_std) = dnn.dnn_batch_normalization_train(
                     input, gamma.dimshuffle(pattern), beta.dimshuffle(pattern),
                     mode, self.epsilon)
+            """
+            (normalized, input_mean, input_inv_std) = \
+              batch_normalization_train(input,gamma.dimshuffle(pattern),beta.dimshuffle(pattern),
+                                        axes=mode, self.epsilon)
 
         # normalize with stored averages, if needed
         if use_averages:
