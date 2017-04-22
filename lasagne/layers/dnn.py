@@ -1,4 +1,5 @@
 import theano
+import theano.tensor as T
 
 from .. import init
 from .. import nonlinearities
@@ -8,12 +9,12 @@ from .conv import conv_output_length, BaseConvLayer
 from .pool import pool_output_length
 from ..utils import as_tuple
 
-from lasagne.layers import BatchNormLayer
+from lasagne.layers import BatchNormLayer, BatchNormDoubleUnbiasedLayer
 
 if theano.gpuarray.dnn.dnn_present():
     from theano.gpuarray import dnn 
     from theano.tensor.signal.pool import pool_3d
-    from theano.tensor.nnet.bn import batch_normalization_train
+    from theano.tensor.nnet import bn 
     from theano.tensor.nnet import conv3d
     print("Using New Theano Backend")
 elif theano.sandbox.cuda.dnn.dnn_available():
@@ -34,6 +35,8 @@ __all__ = [
     "SpatialPyramidPoolingDNNLayer",
     "BatchNormDNNLayer",
     "batch_norm_dnn",
+    "BatchNormDoubleUnbiasedDNNLayer",
+    "batch_norm_double_unbiased_dnn",
 ]
 
 
@@ -262,7 +265,7 @@ class MaxPool3DDNNLayer(Pool3DDNNLayer):
         return dnn.dnn_pool(input, self.pool_size, self.stride,
                             self.mode, self.pad)
         """
-        return pool_3d(input, self.pool_size, stride=self.stride, \
+        return pool_3d(input, self.pool_size, ignore_border=True, stride=self.stride, \
                        pad=self.pad,mode=self.mode)
 
 
@@ -728,16 +731,16 @@ class BatchNormDNNLayer(BatchNormLayer):
             beta = self.beta or theano.tensor.zeros(shape)
             mode = 'per-activation' if self.axes == (0,) else 'spatial'
             
-            """
-            (normalized,
-             input_mean,
-             input_inv_std) = dnn.dnn_batch_normalization_train(
+            (normalized, input_mean, input_inv_std) = \
+              dnn.dnn_batch_normalization_train(
                     input, gamma.dimshuffle(pattern), beta.dimshuffle(pattern),
                     mode, self.epsilon)
             """
             (normalized, input_mean, input_inv_std) = \
-              batch_normalization_train(input,gamma.dimshuffle(pattern),beta.dimshuffle(pattern),
-                                        axes=mode, self.epsilon)
+              bn.batch_normalization_train(input, gamma.dimshuffle(pattern), beta.dimshuffle(pattern), \
+                                           axes=mode, epsilon=self.epsilon) #, running_average_factor=self.alpha, \
+                                           # running_mean=running_mean, running_var=running_var)
+            """
 
         # normalize with stored averages, if needed
         if use_averages:
@@ -804,6 +807,216 @@ def batch_norm_dnn(layer, **kwargs):
         layer = NonlinearityLayer(layer, nonlinearity, name=nonlin_name)
     return layer
 
+class BatchNormDoubleUnbiasedDNNLayer(BatchNormDoubleUnbiasedLayer):
+    """
+    lasagne.layers.BatchNormDNNLayer(incoming, axes='auto', epsilon=1e-4,
+    alpha=0.1, beta=lasagne.init.Constant(0), gamma=lasagne.init.Constant(1),
+    mean=lasagne.init.Constant(0), inv_std=lasagne.init.Constant(1), **kwargs)
+
+    Batch Normalization
+
+    This layer implements batch normalization of its inputs:
+
+    .. math::
+        y = \\frac{x - \\mu}{\\sqrt{\\sigma^2 + \\epsilon}} \\gamma + \\beta
+
+    This is a drop-in replacement for :class:`lasagne.layers.BatchNormLayer`
+    that uses cuDNN for improved performance and reduced memory usage.
+
+    Parameters
+    ----------
+    incoming : a :class:`Layer` instance or a tuple
+        The layer feeding into this layer, or the expected input shape
+    axes : 'auto', int or tuple of int
+        The axis or axes to normalize over. If ``'auto'`` (the default),
+        normalize over all axes except for the second: this will normalize over
+        the minibatch dimension for dense layers, and additionally over all
+        spatial dimensions for convolutional layers. Only supports ``'auto'``
+        and the equivalent axes list, or ``0`` and ``(0,)`` to normalize over
+        the minibatch dimension only.
+    epsilon : scalar
+        Small constant :math:`\\epsilon` added to the variance before taking
+        the square root and dividing by it, to avoid numerical problems. Must
+        not be smaller than ``1e-5``.
+    alpha : scalar
+        Coefficient for the exponential moving average of batch-wise means and
+        standard deviations computed during training; the closer to one, the
+        more it will depend on the last batches seen
+    beta : Theano shared variable, expression, numpy array, callable or None
+        Initial value, expression or initializer for :math:`\\beta`. Must match
+        the incoming shape, skipping all axes in `axes`. Set to ``None`` to fix
+        it to 0.0 instead of learning it.
+        See :func:`lasagne.utils.create_param` for more information.
+    gamma : Theano shared variable, expression, numpy array, callable or None
+        Initial value, expression or initializer for :math:`\\gamma`. Must
+        match the incoming shape, skipping all axes in `axes`. Set to ``None``
+        to fix it to 1.0 instead of learning it.
+        See :func:`lasagne.utils.create_param` for more information.
+    mean : Theano shared variable, expression, numpy array, or callable
+        Initial value, expression or initializer for :math:`\\mu`. Must match
+        the incoming shape, skipping all axes in `axes`.
+        See :func:`lasagne.utils.create_param` for more information.
+    inv_std : Theano shared variable, expression, numpy array, or callable
+        Initial value, expression or initializer for :math:`1 / \\sqrt{
+        \\sigma^2 + \\epsilon}`. Must match the incoming shape, skipping all
+        axes in `axes`.
+        See :func:`lasagne.utils.create_param` for more information.
+    **kwargs
+        Any additional keyword arguments are passed to the :class:`Layer`
+        superclass.
+
+    Notes
+    -----
+    This layer should be inserted between a linear transformation (such as a
+    :class:`DenseLayer`, or :class:`Conv2DLayer`) and its nonlinearity. The
+    convenience function :func:`batch_norm_dnn` modifies an existing layer to
+    insert cuDNN batch normalization in front of its nonlinearity.
+
+    For further information, see :class:`lasagne.layers.BatchNormLayer`. This
+    implementation is fully compatible, except for restrictions on the `axes`
+    and `epsilon` arguments.
+
+    See also
+    --------
+    batch_norm_dnn : Convenience function to apply batch normalization
+    """
+    def __init__(self, incoming, axes='auto', epsilon=1e-4, alpha=0.1, alpha2=0.05, start_i=init.Constant(0),
+                 beta=init.Constant(0), gamma=init.Constant(1),
+                 mean=init.Constant(0), mean_diff=init.Constant(0),
+                 inv_logstd=init.Constant(0), inv_logstd_diff=init.Constant(0), **kwargs):
+
+        super(BatchNormDoubleUnbiasedDNNLayer, self).__init__(
+                incoming, axes, epsilon, alpha, alpha2, start_i, beta, gamma, mean, mean_diff, inv_logstd, inv_logstd_diff, \
+                **kwargs)
+        all_but_second_axis = (0,) + tuple(range(2, len(self.input_shape)))
+        if self.axes not in ((0,), all_but_second_axis):
+            raise ValueError("BatchNormDNNLayer only supports normalization "
+                             "across the first axis, or across all but the "
+                             "second axis, got axes=%r" % (axes,))
+
+    def get_output_for(self, input, deterministic=False,
+                       batch_norm_use_averages=None,
+                       batch_norm_update_averages=None, **kwargs):
+        # Decide whether to use the stored averages or mini-batch statistics
+        if batch_norm_use_averages is None:
+            batch_norm_use_averages = deterministic
+        use_averages = batch_norm_use_averages
+
+        # Decide whether to update the stored averages
+        if batch_norm_update_averages is None:
+            batch_norm_update_averages = not deterministic
+        update_averages = batch_norm_update_averages
+
+        # prepare dimshuffle pattern inserting broadcastable axes as needed
+        param_axes = iter(range(input.ndim - len(self.axes)))
+        pattern = ['x' if input_axis in self.axes
+                   else next(param_axes)
+                   for input_axis in range(input.ndim)]
+        # and prepare the converse pattern removing those broadcastable axes
+        unpattern = [d for d in range(input.ndim) if d not in self.axes]
+
+        # call cuDNN if needed, obtaining normalized outputs and statistics
+        if not use_averages or update_averages:
+            # cuDNN requires beta/gamma tensors; create them if needed
+            shape = tuple(s for (d, s) in enumerate(input.shape)
+                          if d not in self.axes)
+            gamma = self.gamma or theano.tensor.ones(shape)
+            beta = self.beta or theano.tensor.zeros(shape)
+            mode = 'per-activation' if self.axes == (0,) else 'spatial'
+            
+            (normalized, input_mean, input_inv_std) = \
+              dnn.dnn_batch_normalization_train(
+                    input, gamma.dimshuffle(pattern), beta.dimshuffle(pattern),
+                    mode, self.epsilon)
+            input_inv_logstd = T.log(input_inv_std)
+            """
+            (normalized, input_mean, input_inv_std) = \
+              bn.batch_normalization_train(input, gamma.dimshuffle(pattern), beta.dimshuffle(pattern), \
+                                           axes=mode, epsilon=self.epsilon) #, running_average_factor=self.alpha, \
+                                           # running_mean=running_mean, running_var=running_var)
+            """
+
+        # normalize with stored averages, if needed
+        if use_averages:
+            mean = self.mean.dimshuffle(pattern)
+            inv_std = T.exp(self.inv_logstd.dimshuffle(pattern))
+            gamma = 1 if self.gamma is None else self.gamma.dimshuffle(pattern)
+            beta = 0 if self.beta is None else self.beta.dimshuffle(pattern)
+            normalized = (input - mean) * (gamma * inv_std) + beta
+
+        # update stored averages, if needed
+        if update_averages:
+            # Trick: To update the stored statistics, we create memory-aliased
+            # clones of the stored statistics:
+            running_mean = theano.clone(self.mean, share_inputs=False)
+            running_mean_diff = theano.clone(self.mean_diff, share_inputs=False)
+            running_inv_logstd = theano.clone(self.inv_logstd, share_inputs=False)
+            running_inv_logstd_diff = theano.clone(self.inv_logstd_diff, share_inputs=False)
+            running_i = theano.clone(self.i, share_inputs=False)
+            # set a default update for them:
+            
+            # Use shorter alphas at initialization to approximate unbiased estimation 
+            my_alpha = 1./T.clip(1./self.alpha,1.+running_i,1e12)
+            my_alpha2 = 1./T.clip(1./self.alpha2,1.+running_i,1e12)
+            
+            running_mean.default_update = (1 - my_alpha) * (running_mean + running_mean_diff) + \
+                                          my_alpha * input_mean.dimshuffle(unpattern)
+            running_mean_diff.default_update = (1 - my_alpha2) * running_mean_diff + \
+                                               my_alpha2 * (running_mean - running_mean.default_update)
+            
+            running_inv_logstd.default_update = (1 - my_alpha) * (running_inv_logstd + running_inv_logstd_diff) + \
+                                                my_alpha * input_inv_logstd.dimshuffle(unpattern)
+            running_inv_logstd_diff.default_update = (1 - self.alpha2) * running_inv_logstd_diff + \
+                                                     my_alpha2 * (running_inv_logstd - running_inv_logstd.default_update)
+             
+            running_i.default_update = running_i + 1
+            
+            # and make sure they end up in the graph without participating in
+            # the computation (this way their default_update will be collected
+            # and applied, but the computation will be optimized away):
+            dummy = 0 * (running_mean + running_mean_diff + \
+                         running_inv_logstd + running_inv_logstd_diff + \
+                         running_i).dimshuffle(pattern)
+            normalized = normalized + dummy
+
+        return normalized
+
+
+def batch_norm_double_unbiased_dnn(layer, **kwargs):
+    """
+    Apply cuDNN batch normalization to an existing layer. This is a drop-in
+    replacement for :func:`lasagne.layers.batch_norm`; see there for further
+    information.
+
+    Parameters
+    ----------
+    layer : A :class:`Layer` instance
+        The layer to apply the normalization to; note that it will be
+        modified as specified in :func:`lasagne.layers.batch_norm`
+    **kwargs
+        Any additional keyword arguments are passed on to the
+        :class:`BatchNormDNNLayer` constructor.
+
+    Returns
+    -------
+    BatchNormDNNLayer or NonlinearityLayer instance
+        A batch normalization layer stacked on the given modified `layer`, or
+        a nonlinearity layer stacked on top of both if `layer` was nonlinear.
+    """
+    nonlinearity = getattr(layer, 'nonlinearity', None)
+    if nonlinearity is not None:
+        layer.nonlinearity = nonlinearities.identity
+    if hasattr(layer, 'b') and layer.b is not None:
+        del layer.params[layer.b]
+        layer.b = None
+    bn_name = (kwargs.pop('name', None) or
+               (getattr(layer, 'name', None) and layer.name + '_bn'))
+    layer = BatchNormDoubleUnbiasedDNNLayer(layer, name=bn_name, **kwargs)
+    if nonlinearity is not None:
+        from .special import NonlinearityLayer
+        nonlin_name = bn_name and bn_name + '_nonlin'
+        layer = NonlinearityLayer(layer, nonlinearity, name=nonlin_name)
+    return layer
 
 if not hasattr(dnn, 'dnn_batch_normalization_train'):
     # Hide cuDNN-based batch normalization for old Theano versions
